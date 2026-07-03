@@ -46,8 +46,9 @@ _POSITIONS: dict[str, str] = {
     "wide-receiver":    "WR",
     "running-back":     "RB",
     "tight-end":        "TE",
-    "offensive-tackle": "OT",
-    "offensive-guard":  "OG",
+    "left-tackle":      "OT",
+    "right-tackle":     "OT",
+    "guard":            "OG",
     "center":           "C",
     "defensive-tackle": "DT",
     "edge-rusher":      "EDGE",
@@ -87,9 +88,10 @@ def _parse_dollars(text: str) -> float:
     # Handle 'K' suffix
     if text.upper().endswith("K"):
         return float(text[:-1]) / 1000
-    # Plain number in dollars: convert to millions
+    # Plain number: OTC formats raw dollars ("$850,000", "$45,000,000").
+    # Anything >= 10k must be raw dollars — no NFL AAV is $10,000M.
     val = float(text)
-    if val > 1_000_000:
+    if val >= 10_000:
         return val / 1_000_000
     return val
 
@@ -110,9 +112,11 @@ def _parse_otc_table(html: str, position_group: str, source_url: str) -> list[Co
     """
     Parse one OTC position page into a list of Contract objects.
 
-    OTC table headers (as of 2024-2025):
-        Player | Pos | Team | Age | Yrs | Total | Gtd | APY | Type
+    OTC position-page headers (as of 2026):
+        Player | Team | Age | TotalValue | Avg./Year | TotalGuaranteed |
+        FullyGuaranteed | FreeAgency
     Dollar columns contain formatted strings like "$45,000,000".
+    FreeAgency looks like "2034 Void" or "2027 UFA".
     """
     soup = BeautifulSoup(html, "lxml")
     contracts: list[Contract] = []
@@ -134,18 +138,23 @@ def _parse_otc_table(html: str, position_group: str, source_url: str) -> list[Co
         if first_row:
             headers = [td.get_text(strip=True).lower() for td in first_row.find_all(["th", "td"])]
 
-    # Build a flexible column index mapping
-    col = {}
+    # Build the column index mapping on cleaned header names.
+    # Substring matching is dangerous here: "avg./year" contains "year",
+    # "totalguaranteed" contains "total", "freeagency" contains "age" —
+    # so we normalise to letters-only and match exact known names.
+    col: dict[str, int] = {}
     for i, h in enumerate(headers):
-        if "player" in h:             col["player"] = i
-        elif h in ("pos", "position"): col["pos"] = i
-        elif h in ("team", "tm"):      col["team"] = i
-        elif "age" in h:               col["age"] = i
-        elif "yr" in h or "year" in h: col["years"] = i
-        elif "total" in h:             col["total"] = i
-        elif "gtd" in h or "guar" in h: col["guaranteed"] = i
-        elif "apy" in h or "aav" in h:  col["aav"] = i
-        elif "type" in h:              col["type"] = i
+        h_clean = re.sub(r"[^a-z]", "", h)
+        if "player" in h_clean:                          col.setdefault("player", i)
+        elif h_clean in ("pos", "position"):             col.setdefault("pos", i)
+        elif h_clean in ("team", "tm"):                  col.setdefault("team", i)
+        elif h_clean == "age":                           col.setdefault("age", i)
+        elif h_clean in ("avgyear", "apy", "aav"):       col.setdefault("aav", i)
+        elif h_clean in ("totalvalue", "total", "value"): col.setdefault("total", i)
+        elif h_clean in ("totalguaranteed", "gtd", "guaranteed"): col.setdefault("guaranteed", i)
+        elif h_clean == "freeagency":                    col.setdefault("free_agency", i)
+        elif h_clean in ("yrs", "years", "length"):      col.setdefault("years", i)
+        elif "type" in h_clean:                          col.setdefault("type", i)
 
     now_str = datetime.now().isoformat()
     current_year = datetime.now().year
@@ -179,9 +188,18 @@ def _parse_otc_table(html: str, position_group: str, source_url: str) -> list[Co
         if aav <= 0 and total <= 0:
             continue
 
+        # Position pages have no Yrs column — derive length from Total / AAV
+        if years_raw <= 0 and total > 0 and aav > 0:
+            years_raw = max(1, round(total / aav))
         # If APY wasn't parsed but total + years are available, derive it
         if aav <= 0 and total > 0 and years_raw > 0:
             aav = total / years_raw
+
+        # Years remaining from FreeAgency column ("2027 UFA" → FA in 2027)
+        years_remaining = years_raw
+        fa_match = re.match(r"\s*(20\d\d)", _cell("free_agency"))
+        if fa_match:
+            years_remaining = max(0, int(fa_match.group(1)) - current_year)
 
         contracts.append(Contract(
             player_name=player_name,
@@ -189,7 +207,7 @@ def _parse_otc_table(html: str, position_group: str, source_url: str) -> list[Co
             position=pos_raw or position_group,
             age=age,
             years=years_raw,
-            years_remaining=years_raw,   # OTC shows remaining years by default
+            years_remaining=years_remaining,
             total_value=total,
             guaranteed=gtd,
             aav=aav,

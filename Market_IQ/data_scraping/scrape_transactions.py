@@ -218,7 +218,10 @@ def _save_cache(transactions: list[Transaction], date_str: str) -> None:
 
 def _load_cache(date_str: str) -> pd.DataFrame:
     p = _cache_path(date_str)
-    return pd.read_csv(p) if p.exists() else pd.DataFrame()
+    # Zero-byte files mark days with no transactions — pd.read_csv chokes on them
+    if not p.exists() or p.stat().st_size == 0:
+        return pd.DataFrame()
+    return pd.read_csv(p)
 
 
 # ---------------------------------------------------------------------------
@@ -247,9 +250,11 @@ def fetch_transactions_day(date_str: str, force: bool = False) -> pd.DataFrame:
         _save_cache(transactions, date_str)
         logger.debug(f"[{date_str}] {len(transactions)} transactions cached.")
     else:
-        # Cache an empty file so we don't re-fetch a day with no activity
+        # Cache a header-only CSV so we don't re-fetch a day with no activity
         _CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        _cache_path(date_str).write_text("")
+        from dataclasses import fields
+        header = ",".join(f.name for f in fields(Transaction))
+        _cache_path(date_str).write_text(header + "\n")
         logger.debug(f"[{date_str}] No transactions found.")
 
     return pd.DataFrame([asdict(t) for t in transactions]) if transactions else pd.DataFrame()

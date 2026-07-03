@@ -69,9 +69,6 @@ def _jj_from_aav(aav: float, benchmarks: dict) -> tuple[float, int]:
       STARTER_2   → ~pick 65-128 (44-265)
       BACKUP      → <44 JJ pts
     """
-    from Market_IQ.systems.market_value import classify_contract, _TIER_JJ
-    from Draft_IQ.systems.draft_value import _JJ_CHART
-
     # We need position to classify; use QB benchmark as a universal reference
     # This is approximate — the trade analyzer does the precise version
     # Here we just provide a rough pick range for the value report
