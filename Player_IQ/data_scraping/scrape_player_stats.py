@@ -40,30 +40,31 @@ from Core.player_season import PlayerSeason
 logger = logging.getLogger(__name__)
 
 _ESPN_STATS_BASE = (
-    "https://www.espn.com/nfl/stats/player/_/stat/{category}"
+    "https://www.espn.com/nfl/stats/player/_/{path}"
     "/season/{year}/seasontype/2"
-)
-_ESPN_PAGE_URL = (
-    "https://www.espn.com/nfl/stats/player/_/stat/{category}"
-    "/season/{year}/seasontype/2/start/{start}/count/40"
 )
 _ESPN_PLAYER_ID_RE = re.compile(r"/nfl/player/_/id/(\d+)/")
 
 _CACHE_DIR = Path(__file__).parent.parent / "data" / "raw" / "stats"
 
-# Stat categories to scrape and their canonical name
-_CATEGORIES: dict[str, str] = {
-    "passing":       "passing",
-    "rushing":       "rushing",
-    "receiving":     "receiving",
-    "defensive":     "defensive",
-    "interceptions": "interceptions",
+# Stat category → (ESPN URL path segment, sort suffix appended after season).
+# Defense is a "view" (one page covers tackles/sacks/INTs/PD/FF), not a
+# "stat" like the offense categories. The default defense sort is tackles,
+# which misses low-tackle pass rushers and ballhawks — so we make two extra
+# passes sorted by sacks and interceptions and merge by espn_id.
+_CATEGORIES: dict[str, tuple[str, str]] = {
+    "passing":       ("stat/passing", ""),
+    "rushing":       ("stat/rushing", ""),
+    "receiving":     ("stat/receiving", ""),
+    "defense":       ("view/defense", ""),
+    "defense_sacks": ("view/defense", "/table/defensive/sort/sacks/dir/desc"),
+    "defense_ints":  ("view/defense", "/table/defensiveInterceptions/sort/interceptions/dir/desc"),
 }
 
-# How many players per page ESPN returns
-_PAGE_SIZE = 40
-# Maximum pages to fetch per category/year (200 players total)
-_MAX_PAGES = 5
+# ESPN paginates via a "Show More" button that XHR-appends 50 rows to the
+# same table (URL-based /start/N pagination silently returns page 1).
+# 4 clicks → up to 250 players per category/year.
+_SHOW_MORE_CLICKS = 4
 
 _HEADERS = {
     "User-Agent": (
@@ -77,7 +78,11 @@ _HEADERS = {
 # Playwright fetch
 # ---------------------------------------------------------------------------
 
-def _fetch_rendered(url: str, wait_ms: int = 3000) -> str:
+def _fetch_rendered(url: str, show_more_clicks: int = _SHOW_MORE_CLICKS) -> str:
+    """
+    Render an ESPN stats page and click "Show More" up to show_more_clicks
+    times so the table accumulates additional 50-row pages before parsing.
+    """
     from playwright.sync_api import sync_playwright
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=True)
@@ -88,12 +93,17 @@ def _fetch_rendered(url: str, wait_ms: int = 3000) -> str:
         page = ctx.new_page()
         try:
             page.goto(url, wait_until="domcontentloaded", timeout=30_000)
-            # Wait for the stat table to appear
             try:
                 page.wait_for_selector("table", timeout=10_000)
             except Exception:
                 pass
-            time.sleep(wait_ms / 1000)
+            page.wait_for_timeout(1500)
+            for _ in range(show_more_clicks):
+                btn = page.query_selector("a:has-text('Show More')")
+                if not btn:
+                    break   # full list already loaded
+                btn.click()
+                page.wait_for_timeout(1800)
             return page.content()
         finally:
             page.close()
@@ -137,10 +147,21 @@ def _parse_stats_page(html: str, category: str, season: int) -> list[dict]:
     name_table = tables[0]
     stat_table = tables[1]
 
-    # Stat column headers
+    # Stat column headers — the defense view has a group-header row
+    # ("Tackles | Sacks | Interceptions | Fumbles") above the real one,
+    # so take only the LAST row of the thead.
     stat_headers: list[str] = []
-    for th in stat_table.find_all("th"):
-        stat_headers.append(th.get_text(strip=True).upper())
+    thead = stat_table.find("thead")
+    if thead:
+        header_rows = thead.find_all("tr")
+        if header_rows:
+            stat_headers = [
+                th.get_text(strip=True).upper()
+                for th in header_rows[-1].find_all(["th", "td"])
+            ]
+    if not stat_headers:
+        stat_headers = [th.get_text(strip=True).upper()
+                        for th in stat_table.find_all("th")]
 
     def _tbody_rows(table) -> list:
         tbody = table.find("tbody")
@@ -164,24 +185,23 @@ def _parse_stats_page(html: str, category: str, season: int) -> list[dict]:
         player_name = link.get_text(strip=True)
         espn_id = _extract_espn_id(link.get("href", ""))
 
-        # Position sometimes appears as a <span> after the name link
-        pos_span = name_row.find("span", class_=re.compile(r"position|pos", re.I))
-        position = pos_span.get_text(strip=True) if pos_span else ""
-
-        # Team from last meaningful td
+        # Team abbreviation is a span next to the name link in the athlete cell
         team = ""
-        name_tds = name_row.find_all("td")
-        for td in reversed(name_tds):
-            txt = td.get_text(strip=True)
-            if txt and txt != player_name and len(txt) <= 5:
-                team = txt
-                break
+        team_span = name_row.find("span", class_=re.compile(r"team", re.I))
+        if team_span:
+            team = team_span.get_text(strip=True)
 
         # ---- Stats (from right table) ----
+        # POS is a text column inside the stats table; everything else is numeric
+        position = ""
         stat_vals: dict[str, Optional[float]] = {}
         stat_cells = stat_row.find_all("td")
         for header, cell in zip(stat_headers, stat_cells):
-            stat_vals[header] = _safe_float(cell.get_text(strip=True))
+            txt = cell.get_text(strip=True)
+            if header == "POS":
+                position = txt
+                continue
+            stat_vals[header] = _safe_float(txt)
 
         records.append({
             "player_name": player_name,
@@ -222,6 +242,11 @@ def _records_to_player_seasons(
                 "season": season,
                 "fetched_at": data.get("fetched_at", ""),
             }
+        else:
+            # Backfill identity fields a later category may have filled in
+            for key in ("team", "position"):
+                if not by_id[espn_id].get(key) and data.get(key):
+                    by_id[espn_id][key] = data[key]
         by_id[espn_id].update(
             {k: v for k, v in data.items()
              if k not in ("player_name", "team", "position", "season", "category", "fetched_at")
@@ -239,7 +264,7 @@ def _records_to_player_seasons(
         def g(key: str) -> Optional[float]:
             return d.get(key)
 
-        games = int(g("G") or 0)
+        games = int(g("GP") or 0)
         ps = PlayerSeason(
             player_name=d.get("player_name", ""),
             espn_id=eid,
@@ -250,19 +275,18 @@ def _records_to_player_seasons(
             games_started=games,   # ESPN doesn't split starts/games on these pages
             fetched_at=d.get("fetched_at", ""),
 
-            # Passing
-            pass_yards=g("YDS"),     # from passing table
+            # Passing (bare names = passing stats by convention)
+            pass_yards=g("YDS"),
             pass_tds=g("TD"),
             pass_ints=g("INT"),
-            completions=g("COMP"),
+            completions=g("CMP"),
             attempts=g("ATT"),
-            comp_pct=g("PCT"),
+            comp_pct=g("CMP%"),
             pass_avg=g("AVG"),
             qbr=g("QBR"),
             passer_rating=g("RTG"),
 
-            # Rushing — ESPN uses same header YDS; we'll rely on category context
-            # stored under prefixed keys (set below separately after merge issues)
+            # Rushing (renamed per-category to avoid collisions)
             rush_yards=g("RUSH_YDS"),
             rush_tds=g("RUSH_TD"),
             rush_attempts=g("CAR"),
@@ -270,7 +294,7 @@ def _records_to_player_seasons(
 
             # Receiving
             receptions=g("REC"),
-            targets=g("TGT"),
+            targets=g("TGTS"),
             rec_yards=g("REC_YDS"),
             rec_tds=g("REC_TD"),
             rec_avg=g("REC_AVG"),
@@ -293,23 +317,34 @@ def _records_to_player_seasons(
 # Category-aware stat parsing  (rename duplicate column names by category)
 # ---------------------------------------------------------------------------
 
-# ESPN reuses "YDS", "TD", "AVG" across passing/rushing/receiving.
+# ESPN reuses "YDS", "TD", "AVG", "ATT", "SACK", "INT" across categories.
 # We prefix them before merging so they don't collide.
+# (Passing keeps the bare names: YDS/TD/INT/ATT/SACK mean passing stats.)
 _CATEGORY_RENAMES: dict[str, dict[str, str]] = {
     "rushing": {
         "YDS": "RUSH_YDS",
         "TD":  "RUSH_TD",
         "AVG": "RUSH_AVG",
+        "ATT": "CAR",        # carries — passing also has ATT (attempts)
+        "LNG": "RUSH_LNG",
     },
     "receiving": {
         "YDS": "REC_YDS",
         "TD":  "REC_TD",
         "AVG": "REC_AVG",
+        "LNG": "REC_LNG",
     },
-    "interceptions": {
-        "INT": "INT_DEF",   # avoid colliding with passing INT column
+    "defense": {
+        "SACK": "SACKS",     # passing SACK = sacks taken by the QB
+        "INT":  "INT_DEF",   # passing INT = interceptions thrown
+        "YDS":  "DEF_YDS",
+        "TD":   "DEF_TD",
+        "LNG":  "DEF_LNG",
     },
 }
+# The sack- and INT-sorted defense passes share the defense renames
+_CATEGORY_RENAMES["defense_sacks"] = _CATEGORY_RENAMES["defense"]
+_CATEGORY_RENAMES["defense_ints"] = _CATEGORY_RENAMES["defense"]
 
 
 def _rename_cols(records: list[dict], category: str) -> list[dict]:
@@ -371,32 +406,26 @@ def scrape_stats_category(
         return cached
 
     print(f"[{category}/{year}] Scraping ESPN stats...")
-    all_records: list[dict] = []
-    seen_ids: set[str] = set()
 
-    # First page (no pagination params)
-    url = _ESPN_STATS_BASE.format(category=category, year=year)
-    html = _fetch_rendered(url)
-    records = _rename_cols(_parse_stats_page(html, category, year), category)
-    new = [r for r in records if r.get("espn_id") not in seen_ids]
-    all_records.extend(new)
-    seen_ids.update(r.get("espn_id", "") for r in new)
-
-    # Subsequent pages
-    start = _PAGE_SIZE + 1
-    for page in range(2, _MAX_PAGES + 1):
-        if len(records) < _PAGE_SIZE:
-            break   # ESPN returned fewer rows — we've hit the end
-        time.sleep(page_delay)
-        url = _ESPN_PAGE_URL.format(category=category, year=year, start=start)
+    # One rendered page with "Show More" clicked accumulates all rows
+    path, suffix = _CATEGORIES.get(category, (f"stat/{category}", ""))
+    url = _ESPN_STATS_BASE.format(path=path, year=year) + suffix
+    records: list[dict] = []
+    for attempt in range(2):   # ESPN renders are occasionally flaky — retry once
         html = _fetch_rendered(url)
         records = _rename_cols(_parse_stats_page(html, category, year), category)
-        new = [r for r in records if r.get("espn_id") not in seen_ids]
-        if not new:
+        if records:
             break
-        all_records.extend(new)
-        seen_ids.update(r.get("espn_id", "") for r in new)
-        start += _PAGE_SIZE
+        time.sleep(3)
+
+    # Dedupe by espn_id (Show More re-renders can rarely duplicate rows)
+    seen_ids: set[str] = set()
+    all_records: list[dict] = []
+    for r in records:
+        eid = r.get("espn_id", "")
+        if eid and eid not in seen_ids:
+            seen_ids.add(eid)
+            all_records.append(r)
 
     if all_records:
         _save_cache(all_records, year, category)
