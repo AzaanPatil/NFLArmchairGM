@@ -201,7 +201,7 @@ class PlayerValueModel:
         games_pct_1yr: float = 0.85,
         games_pct_2yr: float = 0.85,
         games_pct_3yr: float = 0.85,
-        current_year: int = 2024,
+        current_year: Optional[int] = None,
     ) -> dict:
         """
         Full value report for one player:
