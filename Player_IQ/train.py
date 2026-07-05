@@ -26,17 +26,28 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 def run_training(verbose: bool = True) -> None:
     from Player_IQ.data_scraping.scrape_player_stats import load_stats_cache
     from Market_IQ.data_scraping.scrape_contracts import load_contracts_cache
-    from Player_IQ.systems.features import build_training_matrix
+    from Market_IQ.data_scraping.scrape_contract_history import (
+        scrape_contract_history, load_cap_by_year,
+    )
+    from Player_IQ.systems.features import build_training_matrix_history
     from Player_IQ.systems.value_model import PlayerValueModel
 
     print("=" * 60)
-    print("  Player_IQ — Value Model Training")
+    print("  Player_IQ - Value Model Training")
     print("=" * 60)
 
     # --- Load data ---
-    print("\n[1/4] Loading contracts...")
-    contracts_df = load_contracts_cache()
-    print(f"  {len(contracts_df)} contracts loaded.")
+    print("\n[1/4] Loading contract history (real signing years + cap %)...")
+    history_df = scrape_contract_history()   # cached for 7 days
+    caps = load_cap_by_year()
+    cap_now = caps[max(caps)]
+    print(f"  {len(history_df)} historical contracts | today's cap: ${cap_now:.0f}M")
+
+    # Current contracts provide ages for back-calculating age-at-signing
+    try:
+        contracts_df = load_contracts_cache()
+    except FileNotFoundError:
+        contracts_df = None
 
     print("\n[2/4] Loading player stats...")
     try:
@@ -49,30 +60,25 @@ def run_training(verbose: bool = True) -> None:
             "    python -m Player_IQ.main --scrape\n"
             "  Or train with contracts only (lower accuracy, no stats features):"
         )
-        _train_contracts_only(contracts_df)
+        if contracts_df is not None:
+            _train_contracts_only(contracts_df)
         return
 
     # --- Feature engineering ---
     print("\n[3/4] Building feature matrix...")
-    X, y, names = build_training_matrix(contracts_df, stats_df)
+    X, y, names = build_training_matrix_history(history_df, stats_df, contracts_df)
     print(f"  Feature matrix: {X.shape}  |  Targets: {y.shape}")
-    print(f"  AAV range: ${y.min():.1f}M – ${y.max():.1f}M  |  "
-          f"Mean: ${y.mean():.1f}M  |  Median: ${float(__import__('numpy').median(y)):.1f}M")
-
-    if len(y) < 50:
-        print(
-            f"\n  WARNING: Only {len(y)} matched samples — model accuracy will be limited.\n"
-            "  The more stats data you have (--scrape), the better."
-        )
+    print(f"  cap% range: {y.min():.2f}-{y.max():.2f}  |  "
+          f"Mean: {y.mean():.2f}  |  Median: {float(__import__('numpy').median(y)):.2f}")
 
     # --- Train ---
     print("\n[4/4] Training GradientBoostingRegressor...")
-    model = PlayerValueModel.train(X, y, names)
+    model = PlayerValueModel.train(X, y, names, target="cap_pct", cap_now=cap_now)
     model.save()
 
     print(f"\n  {model.eval_summary()}")
     print("\nTraining complete. Run predictions with:")
-    print("  python -m Player_IQ.main --player \"Justin Jefferson\" --position WR --age 26")
+    print("  python -m Player_IQ.main --player \"Justin Jefferson\" --position WR --age 27")
 
 
 def _train_contracts_only(contracts_df) -> None:

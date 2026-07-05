@@ -140,11 +140,19 @@ class PlayerValueModel:
         max_depth: int = 4,
         subsample: float = 0.8,
         random_state: int = 42,
+        target: str = "cap_pct",
+        cap_now: float = 300.0,
     ) -> "PlayerValueModel":
+        """
+        target="cap_pct": y is APY as % of the salary cap at signing
+        (era-invariant); predictions are converted to $ using cap_now.
+        target="aav_millions": y is raw AAV in $M (legacy mode).
+        """
         from sklearn.ensemble import GradientBoostingRegressor
         from sklearn.model_selection import cross_val_score
 
-        print(f"Training on {len(y)} samples, {X.shape[1]} features...")
+        print(f"Training on {len(y)} samples, {X.shape[1]} features "
+              f"(target: {target})...")
 
         gbr = GradientBoostingRegressor(
             n_estimators=n_estimators,
@@ -161,7 +169,11 @@ class PlayerValueModel:
             gbr, X, y, cv=5, scoring="neg_mean_absolute_error"
         )
         mae = -cv_scores.mean()
-        print(f"5-fold CV MAE: ${mae:.2f}M AAV")
+        if target == "cap_pct":
+            print(f"5-fold CV MAE: {mae:.3f}% of cap "
+                  f"(~${mae / 100 * cap_now:.2f}M at today's ${cap_now:.0f}M cap)")
+        else:
+            print(f"5-fold CV MAE: ${mae:.2f}M AAV")
 
         # Feature importance
         importances = sorted(
@@ -174,7 +186,9 @@ class PlayerValueModel:
 
         meta = {
             "n_samples": len(y),
-            "cv_mae_millions": round(float(mae), 3),
+            "target": target,
+            "cap_now": cap_now,
+            "cv_mae": round(float(mae), 4),
             "feature_names": FEATURE_NAMES,
             "trained_at": __import__("datetime").datetime.now().isoformat(),
         }
@@ -184,12 +198,22 @@ class PlayerValueModel:
     # Inference
     # ------------------------------------------------------------------
 
-    def predict_aav(self, X: np.ndarray) -> np.ndarray:
-        """Raw model prediction — returns AAV in $M for each row in X."""
+    def predict_cap_pct(self, X: np.ndarray) -> np.ndarray:
+        """Predicted APY as % of the salary cap (cap_pct models only)."""
         if self._gbr is None:
             raise RuntimeError("Model not trained. Call train() or load() first.")
         preds = self._gbr.predict(X)
-        return np.maximum(preds, 1.0)   # floor at $1M (minimum contract)
+        return np.maximum(preds, 0.3)   # floor near the minimum-salary cap hit
+
+    def predict_aav(self, X: np.ndarray) -> np.ndarray:
+        """Predicted AAV in $M at TODAY's salary cap for each row in X."""
+        if self._gbr is None:
+            raise RuntimeError("Model not trained. Call train() or load() first.")
+        if self._meta.get("target") == "cap_pct":
+            cap_now = float(self._meta.get("cap_now", 300.0))
+            return self.predict_cap_pct(X) / 100.0 * cap_now
+        preds = self._gbr.predict(X)
+        return np.maximum(preds, 1.0)   # legacy $M model: floor at $1M
 
     def value_report(
         self,
@@ -276,9 +300,16 @@ class PlayerValueModel:
 
     def eval_summary(self) -> str:
         m = self._meta
+        if m.get("target") == "cap_pct":
+            return (
+                f"Model trained on {m.get('n_samples', '?')} samples | "
+                f"CV MAE: {m.get('cv_mae', '?')}% of cap | "
+                f"today's cap: ${m.get('cap_now', '?')}M | "
+                f"Trained: {m.get('trained_at', 'unknown')}"
+            )
         return (
             f"Model trained on {m.get('n_samples', '?')} samples | "
-            f"CV MAE: ${m.get('cv_mae_millions', '?')}M | "
+            f"CV MAE: ${m.get('cv_mae', m.get('cv_mae_millions', '?'))}M | "
             f"Trained: {m.get('trained_at', 'unknown')}"
         )
 

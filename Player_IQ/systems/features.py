@@ -324,6 +324,93 @@ def build_training_matrix(
     return X, y, names
 
 
+def build_training_matrix_history(
+    history_df: pd.DataFrame,
+    stats_df: pd.DataFrame,
+    current_contracts_df: Optional[pd.DataFrame] = None,
+) -> tuple[np.ndarray, np.ndarray, list[str]]:
+    """
+    Build (X, y, names) from the OTC contract HISTORY, which has real
+    signing years. Stats are anchored at signed_year - 1 (the season a
+    team actually paid for), and the target is cap_pct — APY as % of the
+    salary cap at signing — so the model is era-invariant.
+
+    history_df columns: player_name, position, signed_year, aav, cap_pct
+    current_contracts_df (optional): used to back-calculate age at signing
+    for active players (OTC history has no age column).
+
+    Rookie deals are excluded: a contract signed before the player's first
+    recorded season is draft-slotted, not production-priced, and would
+    teach the model that zero stats can mean a big payday.
+    """
+    from datetime import datetime
+    this_year = datetime.now().year
+
+    stats_df = stats_df.copy()
+    stats_df["_norm_name"] = stats_df["player_name"].apply(_normalise_name)
+    min_stats_season = int(stats_df["season"].min())
+
+    # First recorded season per player (for rookie-deal detection + age est.)
+    entry_year: dict[str, int] = (
+        stats_df.groupby("_norm_name")["season"].min().astype(int).to_dict()
+    )
+
+    # Current age lookup from the active-contracts cache
+    age_now: dict[str, float] = {}
+    if current_contracts_df is not None and not current_contracts_df.empty:
+        for _, r in current_contracts_df.iterrows():
+            a = r.get("age")
+            if a is not None and not pd.isna(a) and float(a) > 0:
+                age_now[_normalise_name(str(r.get("player_name", "")))] = float(a)
+
+    X_rows: list[list[float]] = []
+    y_vals: list[float] = []
+    names: list[str] = []
+    skipped_rookie = 0
+
+    for _, row in history_df.iterrows():
+        cap_pct = float(row.get("cap_pct", 0) or 0)
+        signed_year = int(row.get("signed_year", 0) or 0)
+        # Need at least one full season of stats before the signing
+        if cap_pct <= 0 or signed_year <= min_stats_season:
+            continue
+
+        player_name = str(row.get("player_name", ""))
+        pos = _normalise_pos(str(row.get("position", "")))
+        norm = _normalise_name(player_name)
+
+        # Skip rookie deals: signed before (or in) the player's first season
+        first_season = entry_year.get(norm)
+        if first_season is not None and signed_year <= first_season:
+            skipped_rookie += 1
+            continue
+
+        # Age at signing: back-calculate from current age, else estimate
+        # from league entry (~22 at first season), else league-average 26
+        if norm in age_now:
+            age_at_signing = max(21.0, age_now[norm] - (this_year - signed_year))
+        elif first_season is not None and first_season > min_stats_season:
+            age_at_signing = 22.0 + (signed_year - first_season)
+        else:
+            age_at_signing = 26.0
+
+        player_stats = _player_season_table(stats_df, player_name, pos)
+        feature_vec = build_feature_vector(
+            pos, age_at_signing, player_stats, anchor_year=signed_year - 1
+        )
+
+        X_rows.append(feature_vec)
+        y_vals.append(cap_pct)
+        names.append(player_name)
+
+    if skipped_rookie:
+        print(f"  Excluded {skipped_rookie} rookie deals (draft-slotted, not market-priced).")
+
+    X = np.array(X_rows, dtype=np.float32)
+    y = np.array(y_vals, dtype=np.float32)
+    return X, y, names
+
+
 def player_to_features(
     player_name: str,
     position: str,
